@@ -612,7 +612,7 @@ class SoundMonitorService : Service() {
                 )
                 .apply()
 
-            playAlert()
+            playAlert(currentSession)
         }
     }
 
@@ -696,10 +696,10 @@ class SoundMonitorService : Service() {
         expectedSession: Long,
         message: String
     ) {
-        synchronized(lifecycleLock) {
-            if (!isSessionActive(expectedSession)) return
+        handler.post {
+            if (!isSessionActive(expectedSession)) return@post
+            updateNotification(message)
         }
-        updateNotification(message)
     }
 
     @Suppress("DEPRECATION")
@@ -711,99 +711,95 @@ class SoundMonitorService : Service() {
         }
     }
 
-    private fun playAlert() {
+    private fun playAlert(currentSession: Long) {
 
         try {
 
-            if (destroyed) return
-
             releaseAlertAudioFocus()
 
-            // Ignore the short microphone echo caused by the app's own beep.
-            ignoreInputUntil =
-                android.os.SystemClock.elapsedRealtime() + 900L
+            synchronized(lifecycleLock) {
+                if (destroyed || !isSessionActive(currentSession)) return
 
-            val audioManager =
-                getSystemService(Context.AUDIO_SERVICE)
-                    as AudioManager
+                // Ignore the short microphone echo caused by the app's own beep.
+                ignoreInputUntil =
+                    android.os.SystemClock.elapsedRealtime() + 900L
 
-            var focusRequest: AudioFocusRequest? = null
+                val audioManager =
+                    getSystemService(Context.AUDIO_SERVICE)
+                        as AudioManager
 
-            val listener =
-                AudioManager.OnAudioFocusChangeListener {
-                    // لا نحتاج معالجة إضافية هنا
+                var focusRequest: AudioFocusRequest? = null
+
+                val listener =
+                    AudioManager.OnAudioFocusChangeListener {
+                        // لا نحتاج معالجة إضافية هنا
+                    }
+
+                if (Build.VERSION.SDK_INT >= 26) {
+
+                    val attributes =
+                        AudioAttributes.Builder()
+                            .setUsage(
+                                AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+                            )
+                            .setContentType(
+                                AudioAttributes.CONTENT_TYPE_SONIFICATION
+                            )
+                            .build()
+
+                    focusRequest =
+                        AudioFocusRequest.Builder(
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                        )
+                            .setAudioAttributes(attributes)
+                            .setOnAudioFocusChangeListener(listener)
+                            .build()
+
                 }
 
-            if (Build.VERSION.SDK_INT >= 26) {
+                synchronized(audioFocusLock) {
+                    activeAudioManager = audioManager
+                    activeFocusRequest = focusRequest
+                    activeFocusListener = listener
+                }
 
-                val attributes =
-                    AudioAttributes.Builder()
-                        .setUsage(
-                            AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
-                        )
-                        .setContentType(
-                            AudioAttributes.CONTENT_TYPE_SONIFICATION
-                        )
-                        .build()
-
-                focusRequest =
-                    AudioFocusRequest.Builder(
+                if (Build.VERSION.SDK_INT >= 26) {
+                    audioManager.requestAudioFocus(focusRequest!!)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.requestAudioFocus(
+                        listener,
+                        AudioManager.STREAM_MUSIC,
                         AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                     )
-                        .setAudioAttributes(attributes)
-                        .setOnAudioFocusChangeListener(listener)
-                        .build()
+                }
 
-                audioManager.requestAudioFocus(focusRequest)
+                try {
+                    tone?.release()
+                } catch (_: Exception) {
+                }
 
-            } else {
-
-                @Suppress("DEPRECATION")
-                audioManager.requestAudioFocus(
-                    listener,
+                tone = ToneGenerator(
                     AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                    90
                 )
+
+                tone?.startTone(
+                    ToneGenerator.TONE_PROP_BEEP,
+                    450
+                )
+
+                vibrate()
+
+                val releaseRunnable = Runnable {
+                    releaseAlertAudioFocus()
+                }
+
+                synchronized(audioFocusLock) {
+                    alertReleaseRunnable = releaseRunnable
+                }
+                handler.postDelayed(releaseRunnable, 900)
             }
-
-            var releaseImmediately = false
-            synchronized(audioFocusLock) {
-                activeAudioManager = audioManager
-                activeFocusRequest = focusRequest
-                activeFocusListener = listener
-                releaseImmediately = destroyed
-            }
-
-            if (releaseImmediately) {
-                releaseAlertAudioFocus()
-                return
-            }
-
-            try {
-                tone?.release()
-            } catch (_: Exception) {
-            }
-
-            tone = ToneGenerator(
-                AudioManager.STREAM_MUSIC,
-                90
-            )
-
-            tone?.startTone(
-                ToneGenerator.TONE_PROP_BEEP,
-                450
-            )
-
-            vibrate()
-
-            val releaseRunnable = Runnable {
-                releaseAlertAudioFocus()
-            }
-
-            synchronized(audioFocusLock) {
-                alertReleaseRunnable = releaseRunnable
-            }
-            handler.postDelayed(releaseRunnable, 900)
 
         } catch (_: Exception) {
             releaseAlertAudioFocus()
@@ -951,6 +947,8 @@ class SoundMonitorService : Service() {
             ?.takeUnless { it === Thread.currentThread() }
             ?.interrupt()
 
+        releaseAlertAudioFocus()
+
         sendUpdate(
             status = "متوقف",
             eventName = "لم يبدأ تحليل الأصوات",
@@ -1051,11 +1049,8 @@ class SoundMonitorService : Service() {
         val wasReading: Boolean
         val threadToStop: Thread?
 
-        synchronized(audioFocusLock) {
-            destroyed = true
-        }
-
         synchronized(lifecycleLock) {
+            destroyed = true
             wasReading = reading
             reading = false
             serviceRunning = false
