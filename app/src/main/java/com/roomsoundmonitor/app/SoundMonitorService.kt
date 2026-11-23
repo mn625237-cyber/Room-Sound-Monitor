@@ -233,7 +233,10 @@ class SoundMonitorService : Service() {
                     classifier.requiredInputBufferSize
 
                 recorder = localRecorder
-                localRecorder.startRecording()
+                synchronized(lifecycleLock) {
+                    if (!isSessionActive(currentSession)) return@Thread
+                    localRecorder.startRecording()
+                }
 
                 if (!isSessionActive(currentSession)) return@Thread
 
