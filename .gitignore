@@ -1,0 +1,43 @@
+# Android build outputs
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+*.class
+**/build/
+.gradle/
+.kotlin/
+.cg/
+local.properties
+
+# IDE files
+.idea/
+*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Sensitive signing files - NEVER UPLOAD
+*.keystore
+*.jks
+release.properties
+*.p12
+*.pem
+
+# Secrets and credentials
+.env
+.env.*
+google-services.json
+*service-account*.json
+
+# Logs and generated files
+*.log
+/bin/
+/gen/
+/out/
+
+# Local backup copies
+*_backup.*
+*_before_*.*

@@ -1,0 +1,930 @@
+
+package com.roomsoundmonitor.app
+
+import android.app.Service
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.Context
+import android.content.pm.ServiceInfo
+import android.media.AudioManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioRecord
+import android.media.ToneGenerator
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.core.app.NotificationCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import org.tensorflow.lite.support.audio.TensorAudio
+import org.tensorflow.lite.task.audio.classifier.AudioClassifier
+import org.tensorflow.lite.task.audio.classifier.Classifications
+import java.util.Locale
+import kotlin.math.log10
+import kotlin.math.sqrt
+
+class SoundMonitorService : Service() {
+
+    companion object {
+        const val ACTION_START = "com.roomsoundmonitor.app.START"
+        const val ACTION_STOP = "com.roomsoundmonitor.app.STOP"
+        const val ACTION_UPDATE = "com.roomsoundmonitor.app.UPDATE"
+
+        const val CHANNEL_ID = "room_monitor_channel"
+        const val NOTIFICATION_ID = 501
+
+        const val PREFS = "monitor_settings"
+        const val KEY_ACTIVE = "monitoring_active"
+        const val KEY_HISTORY = "events_json"
+        const val KEY_SENSITIVITY = "sensitivity"
+
+        @Volatile
+        var serviceRunning = false
+            private set
+    }
+
+    @Volatile
+    private var reading = false
+
+    @Volatile
+    private var recorder: AudioRecord? = null
+
+    private var worker: Thread? = null
+    private var tone: ToneGenerator? = null
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val consecutiveHits = mutableMapOf<String, Int>()
+    private val lastAlerts = mutableMapOf<String, Long>()
+
+    private var lastLoggedName = ""
+    private var lastLoggedTime = 0L
+
+    private data class EventInfo(
+        val group: String,
+        val name: String,
+        val threshold: Float,
+        val alert: Boolean
+    )
+
+    private data class DetectedEvent(
+        val group: String,
+        val name: String,
+        val score: Float,
+        val alert: Boolean
+    )
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopMonitoring()
+                return START_NOT_STICKY
+            }
+
+            ACTION_START, null -> {
+                startMonitoring()
+            }
+
+            else -> {
+                stopMonitoring()
+                return START_NOT_STICKY
+            }
+        }
+
+        return START_STICKY
+    }
+
+    private fun startMonitoring() {
+
+        if (reading) return
+
+        try {
+            val notification = buildNotification("المراقبة تعمل")
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification
+                )
+            }
+
+        } catch (e: Exception) {
+
+            serviceRunning = false
+
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, false)
+                .remove("last_alert")
+                .apply()
+
+            sendUpdate(
+                status = "متوقف",
+                error = "تعذر تشغيل خدمة المراقبة: ${e.message}",
+                level = 0,
+                db = -90
+            )
+
+            stopSelf()
+            return
+        }
+
+        reading = true
+        serviceRunning = true
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ACTIVE, true)
+            .remove("last_alert")
+            .apply()
+
+        consecutiveHits.clear()
+        lastAlerts.clear()
+        lastLoggedName = ""
+        lastLoggedTime = 0L
+
+        sendUpdate(status = "جارٍ تحميل نموذج الأصوات")
+
+        worker = Thread {
+
+            var classifier: AudioClassifier? = null
+            var localRecorder: AudioRecord? = null
+
+            try {
+
+                val options =
+                    AudioClassifier.AudioClassifierOptions
+                        .builder()
+                        .setMaxResults(20)
+                        .build()
+
+                classifier =
+                    AudioClassifier.createFromFileAndOptions(
+                        applicationContext,
+                        "yamnet.tflite",
+                        options
+                    )
+
+                if (!reading) return@Thread
+
+                localRecorder = classifier.createAudioRecord()
+
+                if (
+                    localRecorder.state !=
+                    AudioRecord.STATE_INITIALIZED
+                ) {
+                    throw IllegalStateException(
+                        "تعذر تهيئة الميكروفون"
+                    )
+                }
+
+                val tensor: TensorAudio =
+                    classifier.createInputTensorAudio()
+
+                val requiredSamples =
+                    classifier.requiredInputBufferSize
+
+                recorder = localRecorder
+
+                localRecorder.startRecording()
+
+                sendUpdate(status = "المراقبة تعمل")
+
+                updateNotification(
+                    "المراقبة نشطة وتعمل في الخلفية"
+                )
+
+                val buffer = FloatArray(1024)
+
+                var totalSamples = 0L
+                var lastClassification = 0L
+                var lastLevelUpdate = 0L
+
+                while (reading) {
+
+                    val count = localRecorder.read(
+                        buffer,
+                        0,
+                        buffer.size,
+                        AudioRecord.READ_BLOCKING
+                    )
+
+                    if (count > 0) {
+
+                        var sum = 0.0
+
+                        for (i in 0 until count) {
+                            val value = buffer[i].toDouble()
+                            sum += value * value
+                        }
+
+                        val rms = sqrt(sum / count)
+
+                        val db = if (rms > 0.000001) {
+                            20.0 * log10(rms)
+                        } else {
+                            -90.0
+                        }
+
+                        tensor.load(buffer, 0, count)
+
+                        totalSamples += count
+
+                        val now =
+                            android.os.SystemClock.elapsedRealtime()
+
+                        if (now - lastLevelUpdate >= 500) {
+
+                            lastLevelUpdate = now
+
+                            val level = (
+                                ((db + 60.0) / 60.0) * 100
+                            ).toInt().coerceIn(0, 100)
+
+                            sendUpdate(
+                                level = level,
+                                db = db.toInt()
+                            )
+                        }
+
+                        val enoughSamples =
+                            totalSamples >= requiredSamples
+
+                        val enoughNewSamples =
+                            totalSamples -
+                                lastClassification >= 8000L
+
+                        if (
+                            enoughSamples &&
+                            enoughNewSamples
+                        ) {
+
+                            val results =
+                                classifier.classify(tensor)
+
+                            lastClassification = totalSamples
+
+                            val detected =
+                                findDetectedEvent(results)
+
+                            processEvent(detected)
+                        }
+
+                    } else if (count < 0) {
+
+                        throw IllegalStateException(
+                            "خطأ قراءة الميكروفون: $count"
+                        )
+                    }
+                }
+
+            } catch (e: Exception) {
+
+                if (reading) {
+
+                    reading = false
+                    serviceRunning = false
+
+                    getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(KEY_ACTIVE, false)
+                        .remove("last_alert")
+                        .apply()
+
+                    handler.post {
+
+                        sendUpdate(
+                            status = "حدث خطأ",
+                            error = e.message
+                                ?: "حدث خطأ أثناء تحليل الصوت",
+                            level = 0,
+                            db = -90
+                        )
+
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                }
+
+            } finally {
+
+                try {
+                    localRecorder?.stop()
+                } catch (_: Exception) {
+                }
+
+                try {
+                    localRecorder?.release()
+                } catch (_: Exception) {
+                }
+
+                try {
+                    classifier?.close()
+                } catch (_: Exception) {
+                }
+
+                if (recorder === localRecorder) {
+                    recorder = null
+                }
+            }
+
+        }.apply {
+            name = "RoomSoundAnalysis"
+            start()
+        }
+    }
+
+    private fun findDetectedEvent(
+        results: List<Classifications>
+    ): DetectedEvent? {
+
+        val sensitivity = getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        ).getInt(KEY_SENSITIVITY, 60)
+
+        val factor =
+            1.4f - (sensitivity / 100f * 0.6f)
+
+        return results
+            .flatMap { it.categories }
+            .mapNotNull { category ->
+
+                val label = category.label
+                    .trim()
+                    .lowercase(Locale.US)
+
+                val info =
+                    getEventInfo(label)
+                        ?: return@mapNotNull null
+
+                val threshold =
+                    info.threshold * factor
+
+                if (category.score < threshold) {
+                    return@mapNotNull null
+                }
+
+                DetectedEvent(
+                    info.group,
+                    info.name,
+                    category.score,
+                    info.alert
+                )
+            }
+            .maxByOrNull { it.score }
+    }
+
+    private fun getEventInfo(
+        label: String
+    ): EventInfo? {
+
+        return when (label) {
+
+            "speech" -> EventInfo(
+                "speech", "كلام بشري", 0.35f, false
+            )
+
+            "child speech, kid speaking" -> EventInfo(
+                "speech", "كلام طفل", 0.35f, false
+            )
+
+            "hubbub, speech noise, speech babble" ->
+                EventInfo(
+                    "speech", "ضوضاء كلام", 0.35f, false
+                )
+
+            "shout" -> EventInfo(
+                "shout", "صراخ", 0.25f, true
+            )
+
+            "children shouting" -> EventInfo(
+                "shout", "أطفال يصرخون", 0.25f, true
+            )
+
+            "screaming" -> EventInfo(
+                "shout", "صراخ حاد", 0.25f, true
+            )
+
+            "clapping" -> EventInfo(
+                "clap", "تصفيق", 0.25f, true
+            )
+
+            "knock" -> EventInfo(
+                "knock", "طرق", 0.25f, true
+            )
+
+            "tap" -> EventInfo(
+                "knock", "نقر", 0.25f, true
+            )
+
+            "thump, thud" -> EventInfo(
+                "impact", "ارتطام مكتوم", 0.25f, true
+            )
+
+            "bang" -> EventInfo(
+                "impact", "ضربة قوية", 0.25f, true
+            )
+
+            "alarm" -> EventInfo(
+                "alarm", "إنذار", 0.25f, true
+            )
+
+            "alarm clock" -> EventInfo(
+                "alarm", "منبه", 0.25f, true
+            )
+
+            "smoke detector, smoke alarm" ->
+                EventInfo(
+                    "alarm", "إنذار كاشف الدخان", 0.25f, true
+                )
+
+            "fire alarm" -> EventInfo(
+                "alarm", "إنذار حريق", 0.25f, true
+            )
+
+            "car alarm" -> EventInfo(
+                "alarm", "إنذار سيارة", 0.25f, true
+            )
+
+            "doorbell" -> EventInfo(
+                "doorbell", "جرس باب", 0.30f, true
+            )
+
+            "door" -> EventInfo(
+                "door", "صوت باب", 0.35f, false
+            )
+
+            "sliding door" -> EventInfo(
+                "door", "باب منزلق", 0.35f, false
+            )
+
+            else -> null
+        }
+    }
+
+    private fun processEvent(
+        event: DetectedEvent?
+    ) {
+
+        if (event == null) {
+
+            consecutiveHits.clear()
+
+            sendUpdate(
+                eventName = "لم يظهر تصنيف مستهدف الآن"
+            )
+
+            return
+        }
+
+        val hits =
+            (consecutiveHits[event.group] ?: 0) + 1
+
+        consecutiveHits.clear()
+        consecutiveHits[event.group] = hits
+
+        val percentage =
+            (event.score * 100).toInt()
+
+        val now =
+            android.os.SystemClock.elapsedRealtime()
+
+        var shouldAlert = false
+
+        if (event.alert && hits >= 2) {
+
+            val previous =
+                lastAlerts[event.group] ?: 0L
+
+            if (now - previous >= 7000L) {
+                lastAlerts[event.group] = now
+                shouldAlert = true
+            }
+        }
+
+        val eventLabel =
+            "${event.name} — $percentage%"
+
+        sendUpdate(
+            eventName = eventLabel,
+            alert = shouldAlert
+        )
+
+        val shouldLog =
+            event.name != lastLoggedName ||
+                now - lastLoggedTime >= 5000L
+
+        if (shouldLog) {
+
+            lastLoggedName = event.name
+            lastLoggedTime = now
+
+            saveEvent(
+                event.name,
+                percentage,
+                shouldAlert
+            )
+        }
+
+        if (shouldAlert) {
+
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(
+                    "last_alert",
+                    "تنبيه: ${event.name}"
+                )
+                .apply()
+
+            playAlert()
+        }
+    }
+
+    private fun saveEvent(
+        name: String,
+        score: Int,
+        alert: Boolean
+    ) {
+
+        val prefs = getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+
+        val old = try {
+            JSONArray(
+                prefs.getString(KEY_HISTORY, "[]")
+            )
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        val updated = JSONArray()
+
+        updated.put(
+            JSONObject().apply {
+                put("name", name)
+                put("score", score)
+                put("alert", alert)
+                put("time", System.currentTimeMillis())
+            }
+        )
+
+        for (i in 0 until minOf(old.length(), 19)) {
+            updated.put(old.getJSONObject(i))
+        }
+
+        prefs.edit()
+            .putString(KEY_HISTORY, updated.toString())
+            .apply()
+
+        sendUpdate(historyChanged = true)
+    }
+
+    private fun playAlert() {
+
+        try {
+
+            val audioManager =
+                getSystemService(Context.AUDIO_SERVICE)
+                    as AudioManager
+
+            var focusRequest: AudioFocusRequest? = null
+
+            val listener =
+                AudioManager.OnAudioFocusChangeListener {
+                    // لا نحتاج معالجة إضافية هنا
+                }
+
+            if (Build.VERSION.SDK_INT >= 26) {
+
+                val attributes =
+                    AudioAttributes.Builder()
+                        .setUsage(
+                            AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+                        )
+                        .setContentType(
+                            AudioAttributes.CONTENT_TYPE_SONIFICATION
+                        )
+                        .build()
+
+                focusRequest =
+                    AudioFocusRequest.Builder(
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    )
+                        .setAudioAttributes(attributes)
+                        .setOnAudioFocusChangeListener(listener)
+                        .build()
+
+                audioManager.requestAudioFocus(focusRequest)
+
+            } else {
+
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(
+                    listener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                )
+            }
+
+            try {
+                tone?.release()
+            } catch (_: Exception) {
+            }
+
+            tone = ToneGenerator(
+                AudioManager.STREAM_MUSIC,
+                90
+            )
+
+            tone?.startTone(
+                ToneGenerator.TONE_PROP_BEEP,
+                450
+            )
+
+            vibrate()
+
+            handler.postDelayed({
+
+                try {
+                    tone?.release()
+                    tone = null
+                } catch (_: Exception) {
+                }
+
+                if (Build.VERSION.SDK_INT >= 26) {
+                    focusRequest?.let {
+                        audioManager.abandonAudioFocusRequest(it)
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.abandonAudioFocus(listener)
+                }
+
+            }, 900)
+
+        } catch (_: Exception) {
+            vibrate()
+        }
+    }
+
+    private fun vibrate() {
+
+        try {
+
+            val vibrator: Vibrator =
+                if (Build.VERSION.SDK_INT >= 31) {
+
+                    val manager =
+                        getSystemService(
+                            Context.VIBRATOR_MANAGER_SERVICE
+                        ) as VibratorManager
+
+                    manager.defaultVibrator
+
+                } else {
+
+                    @Suppress("DEPRECATION")
+                    getSystemService(
+                        Context.VIBRATOR_SERVICE
+                    ) as Vibrator
+                }
+
+            if (Build.VERSION.SDK_INT >= 26) {
+
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(
+                        350,
+                        VibrationEffect.DEFAULT_AMPLITUDE
+                    )
+                )
+
+            } else {
+
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(350)
+            }
+
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun sendUpdate(
+        status: String? = null,
+        eventName: String? = null,
+        level: Int? = null,
+        db: Int? = null,
+        alert: Boolean = false,
+        error: String? = null,
+        historyChanged: Boolean = false
+    ) {
+
+        val intent = Intent(ACTION_UPDATE).apply {
+
+            setPackage(packageName)
+
+            status?.let {
+                putExtra("status", it)
+            }
+
+            eventName?.let {
+                putExtra("event", it)
+            }
+
+            level?.let {
+                putExtra("level", it)
+            }
+
+            db?.let {
+                putExtra("db", it)
+            }
+
+            putExtra("alert", alert)
+            putExtra("history", historyChanged)
+
+            error?.let {
+                putExtra("error", it)
+            }
+        }
+
+        sendBroadcast(intent)
+    }
+
+    private fun stopMonitoring() {
+
+        reading = false
+        serviceRunning = false
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ACTIVE, false)
+            .remove("last_alert")
+            .apply()
+
+        try {
+            recorder?.stop()
+        } catch (_: Exception) {
+        }
+
+        sendUpdate(
+            status = "متوقف",
+            eventName = "لم يبدأ تحليل الأصوات",
+            level = 0,
+            db = -90
+        )
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun createNotificationChannel() {
+
+        if (Build.VERSION.SDK_INT >= 26) {
+
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "مراقبة صوت الغرفة",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description =
+                    "إشعار دائم أثناء مراقبة الأصوات"
+            }
+
+            val manager =
+                getSystemService(
+                    NotificationManager::class.java
+                )
+
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(
+        message: String
+    ): Notification {
+
+        val openIntent =
+            Intent(this, MainActivity::class.java)
+
+        val openPendingIntent =
+            PendingIntent.getActivity(
+                this,
+                1,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or
+                    PendingIntent.FLAG_IMMUTABLE
+            )
+
+        val stopIntent =
+            Intent(this, SoundMonitorService::class.java)
+                .setAction(ACTION_STOP)
+
+        val stopPendingIntent =
+            PendingIntent.getService(
+                this,
+                2,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or
+                    PendingIntent.FLAG_IMMUTABLE
+            )
+
+        return NotificationCompat.Builder(
+            this,
+            CHANNEL_ID
+        )
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("مراقب صوت الغرفة")
+            .setContentText(message)
+            .setContentIntent(openPendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(
+                android.R.drawable.ic_media_pause,
+                "إيقاف",
+                stopPendingIntent
+            )
+            .build()
+    }
+
+    private fun updateNotification(
+        message: String
+    ) {
+
+        val manager =
+            getSystemService(
+                NotificationManager::class.java
+            )
+
+        manager.notify(
+            NOTIFICATION_ID,
+            buildNotification(message)
+        )
+    }
+
+    override fun onDestroy() {
+
+        val wasReading = reading
+
+        reading = false
+        serviceRunning = false
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ACTIVE, false)
+            .remove("last_alert")
+            .apply()
+
+        try {
+            recorder?.stop()
+        } catch (_: Exception) {
+        }
+
+        try {
+            tone?.release()
+        } catch (_: Exception) {
+        }
+
+        tone = null
+
+        if (wasReading) {
+            sendUpdate(
+                status = "متوقف",
+                eventName = "لم يبدأ تحليل الأصوات",
+                level = 0,
+                db = -90
+            )
+        }
+
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+}
