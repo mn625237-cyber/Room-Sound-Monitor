@@ -74,6 +74,8 @@ class SoundMonitorService : Service() {
     private var activeFocusRequest: AudioFocusRequest? = null
     private var activeFocusListener: AudioManager.OnAudioFocusChangeListener? = null
     private var alertReleaseRunnable: Runnable? = null
+    private var nextAlertId = 0L
+    private var activeAlertId = 0L
 
     @Volatile
     private var destroyed = false
@@ -720,6 +722,11 @@ class SoundMonitorService : Service() {
             synchronized(lifecycleLock) {
                 if (destroyed || !isSessionActive(currentSession)) return
 
+                val alertId = synchronized(audioFocusLock) {
+                    nextAlertId += 1L
+                    nextAlertId
+                }
+
                 // Ignore the short microphone echo caused by the app's own beep.
                 ignoreInputUntil =
                     android.os.SystemClock.elapsedRealtime() + 900L
@@ -761,6 +768,7 @@ class SoundMonitorService : Service() {
                     activeAudioManager = audioManager
                     activeFocusRequest = focusRequest
                     activeFocusListener = listener
+                    activeAlertId = alertId
                 }
 
                 if (Build.VERSION.SDK_INT >= 26) {
@@ -792,7 +800,7 @@ class SoundMonitorService : Service() {
                 vibrate()
 
                 val releaseRunnable = Runnable {
-                    releaseAlertAudioFocus()
+                    releaseAlertAudioFocus(alertId)
                 }
 
                 synchronized(audioFocusLock) {
@@ -803,17 +811,25 @@ class SoundMonitorService : Service() {
 
         } catch (_: Exception) {
             releaseAlertAudioFocus()
-            vibrate()
+            synchronized(lifecycleLock) {
+                if (!destroyed && isSessionActive(currentSession)) {
+                    vibrate()
+                }
+            }
         }
     }
 
-    private fun releaseAlertAudioFocus() {
+    private fun releaseAlertAudioFocus(expectedAlertId: Long? = null) {
         val manager: AudioManager?
         val request: AudioFocusRequest?
         val listener: AudioManager.OnAudioFocusChangeListener?
         val releaseRunnable: Runnable?
 
         synchronized(audioFocusLock) {
+            if (expectedAlertId != null && activeAlertId != expectedAlertId) {
+                return
+            }
+
             manager = activeAudioManager
             request = activeFocusRequest
             listener = activeFocusListener
@@ -822,6 +838,7 @@ class SoundMonitorService : Service() {
             activeFocusRequest = null
             activeFocusListener = null
             alertReleaseRunnable = null
+            activeAlertId = 0L
         }
 
         releaseRunnable?.let(handler::removeCallbacks)
