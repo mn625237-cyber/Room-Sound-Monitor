@@ -54,11 +54,30 @@ class SoundMonitorService : Service() {
     @Volatile
     private var reading = false
 
+    private val lifecycleLock = Any()
+
+    /** Changes whenever a monitoring session is started or stopped. */
+    @Volatile
+    private var sessionId = 0L
+
+    @Volatile
+    private var ignoreInputUntil = 0L
+
     @Volatile
     private var recorder: AudioRecord? = null
 
     private var worker: Thread? = null
-    private var tone: ToneGenerator? = null
+    private val audioFocusLock = Any()
+    private var activeAudioManager: AudioManager? = null
+    private var activeFocusRequest: AudioFocusRequest? = null
+    private var activeFocusListener: AudioManager.OnAudioFocusChangeListener? = null
+    private var alertReleaseRunnable: Runnable? = null
+    private var activeTone: ToneGenerator? = null
+    private var nextAlertId = 0L
+    private var activeAlertId = 0L
+
+    @Volatile
+    private var destroyed = false
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -84,6 +103,7 @@ class SoundMonitorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        destroyed = false
         createNotificationChannel()
     }
 
@@ -99,9 +119,11 @@ class SoundMonitorService : Service() {
                 return START_NOT_STICKY
             }
 
-            ACTION_START, null -> {
+            ACTION_START -> {
                 startMonitoring()
             }
+
+            null -> return START_NOT_STICKY
 
             else -> {
                 stopMonitoring()
@@ -109,12 +131,21 @@ class SoundMonitorService : Service() {
             }
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startMonitoring() {
 
-        if (reading) return
+        val currentSession: Long
+
+        synchronized(lifecycleLock) {
+            if (reading || worker?.isAlive == true) return
+
+            currentSession = sessionId + 1
+            sessionId = currentSession
+            reading = true
+            serviceRunning = false
+        }
 
         try {
             val notification = buildNotification("المراقبة تعمل")
@@ -134,13 +165,16 @@ class SoundMonitorService : Service() {
 
         } catch (e: Exception) {
 
-            serviceRunning = false
-
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_ACTIVE, false)
-                .remove("last_alert")
-                .apply()
+            synchronized(lifecycleLock) {
+                reading = false
+                serviceRunning = false
+                sessionId++
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(KEY_ACTIVE, false)
+                    .remove("last_alert")
+                    .apply()
+            }
 
             sendUpdate(
                 status = "متوقف",
@@ -152,15 +186,6 @@ class SoundMonitorService : Service() {
             stopSelf()
             return
         }
-
-        reading = true
-        serviceRunning = true
-
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_ACTIVE, true)
-            .remove("last_alert")
-            .apply()
 
         consecutiveHits.clear()
         lastAlerts.clear()
@@ -189,7 +214,7 @@ class SoundMonitorService : Service() {
                         options
                     )
 
-                if (!reading) return@Thread
+                if (!isSessionActive(currentSession)) return@Thread
 
                 localRecorder = classifier.createAudioRecord()
 
@@ -209,12 +234,23 @@ class SoundMonitorService : Service() {
                     classifier.requiredInputBufferSize
 
                 recorder = localRecorder
+                synchronized(lifecycleLock) {
+                    if (!isSessionActive(currentSession)) return@Thread
+                    localRecorder.startRecording()
+                }
 
-                localRecorder.startRecording()
+                if (!isSessionActive(currentSession)) return@Thread
 
-                sendUpdate(status = "المراقبة تعمل")
+                if (localRecorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    throw IllegalStateException(
+                        "تعذر بدء تسجيل الميكروفون"
+                    )
+                }
 
-                updateNotification(
+                if (!publishSessionRunning(currentSession)) return@Thread
+
+                updateNotificationIfSessionActive(
+                    currentSession,
                     "المراقبة نشطة وتعمل في الخلفية"
                 )
 
@@ -224,7 +260,7 @@ class SoundMonitorService : Service() {
                 var lastClassification = 0L
                 var lastLevelUpdate = 0L
 
-                while (reading) {
+                while (isSessionActive(currentSession)) {
 
                     val count = localRecorder.read(
                         buffer,
@@ -233,7 +269,11 @@ class SoundMonitorService : Service() {
                         AudioRecord.READ_BLOCKING
                     )
 
-                    if (count > 0) {
+                    if (count > 0 && isSessionActive(currentSession)) {
+
+                        if (android.os.SystemClock.elapsedRealtime() < ignoreInputUntil) {
+                            continue
+                        }
 
                         var sum = 0.0
 
@@ -283,6 +323,8 @@ class SoundMonitorService : Service() {
                             enoughNewSamples
                         ) {
 
+                            if (!isSessionActive(currentSession)) break
+
                             val results =
                                 classifier.classify(tensor)
 
@@ -291,7 +333,9 @@ class SoundMonitorService : Service() {
                             val detected =
                                 findDetectedEvent(results)
 
-                            processEvent(detected)
+                            if (isSessionActive(currentSession)) {
+                                processEvent(detected, currentSession)
+                            }
                         }
 
                     } else if (count < 0) {
@@ -304,18 +348,18 @@ class SoundMonitorService : Service() {
 
             } catch (e: Exception) {
 
-                if (reading) {
+                if (isSessionActive(currentSession)) {
+                    synchronized(lifecycleLock) {
+                        if (sessionId == currentSession) {
+                            reading = false
+                            serviceRunning = false
+                        }
+                    }
 
-                    reading = false
-                    serviceRunning = false
-
-                    getSharedPreferences(PREFS, MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(KEY_ACTIVE, false)
-                        .remove("last_alert")
-                        .apply()
+                    markSessionInactive(currentSession)
 
                     handler.post {
+                        if (sessionId != currentSession) return@post
 
                         sendUpdate(
                             status = "حدث خطأ",
@@ -325,7 +369,7 @@ class SoundMonitorService : Service() {
                             db = -90
                         )
 
-                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopForegroundCompat()
                         stopSelf()
                     }
                 }
@@ -347,8 +391,13 @@ class SoundMonitorService : Service() {
                 } catch (_: Exception) {
                 }
 
-                if (recorder === localRecorder) {
-                    recorder = null
+                synchronized(lifecycleLock) {
+                    if (recorder === localRecorder) {
+                        recorder = null
+                    }
+                    if (worker === Thread.currentThread()) {
+                        worker = null
+                    }
                 }
             }
 
@@ -488,8 +537,11 @@ class SoundMonitorService : Service() {
     }
 
     private fun processEvent(
-        event: DetectedEvent?
+        event: DetectedEvent?,
+        currentSession: Long
     ) {
+
+        if (!isSessionActive(currentSession)) return
 
         if (event == null) {
 
@@ -551,7 +603,7 @@ class SoundMonitorService : Service() {
             )
         }
 
-        if (shouldAlert) {
+        if (shouldAlert && isSessionActive(currentSession)) {
 
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
@@ -561,7 +613,7 @@ class SoundMonitorService : Service() {
                 )
                 .apply()
 
-            playAlert()
+            playAlert(currentSession)
         }
     }
 
@@ -606,91 +658,202 @@ class SoundMonitorService : Service() {
         sendUpdate(historyChanged = true)
     }
 
-    private fun playAlert() {
+    private fun isSessionActive(expectedSession: Long): Boolean {
+        return reading && sessionId == expectedSession
+    }
+
+    private fun publishSessionRunning(expectedSession: Long): Boolean {
+        synchronized(lifecycleLock) {
+            if (!isSessionActive(expectedSession)) return false
+
+            serviceRunning = true
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, true)
+                .remove("last_alert")
+                .apply()
+
+            // Publish while holding the lifecycle lock so stopMonitoring()
+            // cannot invalidate this state between the check and the broadcast.
+            sendUpdate(status = "المراقبة تعمل")
+            return true
+        }
+    }
+
+    private fun markSessionInactive(expectedSession: Long? = null) {
+        synchronized(lifecycleLock) {
+            if (expectedSession != null && sessionId != expectedSession) return
+
+            serviceRunning = false
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, false)
+                .remove("last_alert")
+                .apply()
+        }
+    }
+
+    private fun updateNotificationIfSessionActive(
+        expectedSession: Long,
+        message: String
+    ) {
+        handler.post {
+            if (!isSessionActive(expectedSession)) return@post
+            updateNotification(message)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= 24) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            stopForeground(true)
+        }
+    }
+
+    private fun playAlert(currentSession: Long) {
 
         try {
 
-            val audioManager =
-                getSystemService(Context.AUDIO_SERVICE)
-                    as AudioManager
+            releaseAlertAudioFocus()
 
-            var focusRequest: AudioFocusRequest? = null
+            synchronized(lifecycleLock) {
+                if (destroyed || !isSessionActive(currentSession)) return
 
-            val listener =
-                AudioManager.OnAudioFocusChangeListener {
-                    // لا نحتاج معالجة إضافية هنا
+                val alertId = synchronized(audioFocusLock) {
+                    nextAlertId += 1L
+                    nextAlertId
                 }
 
-            if (Build.VERSION.SDK_INT >= 26) {
+                // Ignore the short microphone echo caused by the app's own beep.
+                ignoreInputUntil =
+                    android.os.SystemClock.elapsedRealtime() + 900L
 
-                val attributes =
-                    AudioAttributes.Builder()
-                        .setUsage(
-                            AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+                val audioManager =
+                    getSystemService(Context.AUDIO_SERVICE)
+                        as AudioManager
+
+                var focusRequest: AudioFocusRequest? = null
+
+                val listener =
+                    AudioManager.OnAudioFocusChangeListener {
+                        // لا نحتاج معالجة إضافية هنا
+                    }
+
+                if (Build.VERSION.SDK_INT >= 26) {
+
+                    val attributes =
+                        AudioAttributes.Builder()
+                            .setUsage(
+                                AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+                            )
+                            .setContentType(
+                                AudioAttributes.CONTENT_TYPE_SONIFICATION
+                            )
+                            .build()
+
+                    focusRequest =
+                        AudioFocusRequest.Builder(
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                         )
-                        .setContentType(
-                            AudioAttributes.CONTENT_TYPE_SONIFICATION
-                        )
-                        .build()
+                            .setAudioAttributes(attributes)
+                            .setOnAudioFocusChangeListener(listener)
+                            .build()
 
-                focusRequest =
-                    AudioFocusRequest.Builder(
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                    )
-                        .setAudioAttributes(attributes)
-                        .setOnAudioFocusChangeListener(listener)
-                        .build()
+                }
 
-                audioManager.requestAudioFocus(focusRequest)
-
-            } else {
-
-                @Suppress("DEPRECATION")
-                audioManager.requestAudioFocus(
-                    listener,
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                )
-            }
-
-            try {
-                tone?.release()
-            } catch (_: Exception) {
-            }
-
-            tone = ToneGenerator(
-                AudioManager.STREAM_MUSIC,
-                90
-            )
-
-            tone?.startTone(
-                ToneGenerator.TONE_PROP_BEEP,
-                450
-            )
-
-            vibrate()
-
-            handler.postDelayed({
-
-                try {
-                    tone?.release()
-                    tone = null
-                } catch (_: Exception) {
+                synchronized(audioFocusLock) {
+                    activeAudioManager = audioManager
+                    activeFocusRequest = focusRequest
+                    activeFocusListener = listener
+                    activeAlertId = alertId
                 }
 
                 if (Build.VERSION.SDK_INT >= 26) {
-                    focusRequest?.let {
-                        audioManager.abandonAudioFocusRequest(it)
-                    }
+                    audioManager.requestAudioFocus(focusRequest!!)
                 } else {
                     @Suppress("DEPRECATION")
-                    audioManager.abandonAudioFocus(listener)
+                    audioManager.requestAudioFocus(
+                        listener,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                    )
                 }
 
-            }, 900)
+                val newTone = ToneGenerator(
+                    AudioManager.STREAM_MUSIC,
+                    90
+                )
+
+                synchronized(audioFocusLock) {
+                    activeTone = newTone
+                }
+
+                newTone.startTone(
+                    ToneGenerator.TONE_PROP_BEEP,
+                    450
+                )
+
+                vibrate()
+
+                val releaseRunnable = Runnable {
+                    releaseAlertAudioFocus(alertId)
+                }
+
+                synchronized(audioFocusLock) {
+                    alertReleaseRunnable = releaseRunnable
+                }
+                handler.postDelayed(releaseRunnable, 900)
+            }
 
         } catch (_: Exception) {
-            vibrate()
+            releaseAlertAudioFocus()
+            synchronized(lifecycleLock) {
+                if (!destroyed && isSessionActive(currentSession)) {
+                    vibrate()
+                }
+            }
+        }
+    }
+
+    private fun releaseAlertAudioFocus(expectedAlertId: Long? = null) {
+        val manager: AudioManager?
+        val request: AudioFocusRequest?
+        val listener: AudioManager.OnAudioFocusChangeListener?
+        val releaseRunnable: Runnable?
+        val toneToRelease: ToneGenerator?
+
+        synchronized(audioFocusLock) {
+            if (expectedAlertId != null && activeAlertId != expectedAlertId) {
+                return
+            }
+
+            manager = activeAudioManager
+            request = activeFocusRequest
+            listener = activeFocusListener
+            releaseRunnable = alertReleaseRunnable
+            toneToRelease = activeTone
+            activeAudioManager = null
+            activeFocusRequest = null
+            activeFocusListener = null
+            alertReleaseRunnable = null
+            activeTone = null
+            activeAlertId = 0L
+        }
+
+        releaseRunnable?.let(handler::removeCallbacks)
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            request?.let { manager?.abandonAudioFocusRequest(it) }
+        } else if (manager != null && listener != null) {
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(listener)
+        }
+
+        try {
+            toneToRelease?.release()
+        } catch (_: Exception) {
         }
     }
 
@@ -778,19 +941,30 @@ class SoundMonitorService : Service() {
 
     private fun stopMonitoring() {
 
-        reading = false
-        serviceRunning = false
+        val threadToStop: Thread?
 
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_ACTIVE, false)
-            .remove("last_alert")
-            .apply()
+        synchronized(lifecycleLock) {
+            reading = false
+            serviceRunning = false
+            sessionId++
+            threadToStop = worker
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, false)
+                .remove("last_alert")
+                .apply()
+        }
 
         try {
             recorder?.stop()
         } catch (_: Exception) {
         }
+
+        threadToStop
+            ?.takeUnless { it === Thread.currentThread() }
+            ?.interrupt()
+
+        releaseAlertAudioFocus()
 
         sendUpdate(
             status = "متوقف",
@@ -799,7 +973,7 @@ class SoundMonitorService : Service() {
             db = -90
         )
 
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopForegroundCompat()
         stopSelf()
     }
 
@@ -889,28 +1063,34 @@ class SoundMonitorService : Service() {
 
     override fun onDestroy() {
 
-        val wasReading = reading
+        val wasReading: Boolean
+        val threadToStop: Thread?
 
-        reading = false
-        serviceRunning = false
-
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_ACTIVE, false)
-            .remove("last_alert")
-            .apply()
+        synchronized(lifecycleLock) {
+            destroyed = true
+            wasReading = reading
+            reading = false
+            serviceRunning = false
+            sessionId++
+            threadToStop = worker
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, false)
+                .remove("last_alert")
+                .apply()
+        }
 
         try {
             recorder?.stop()
         } catch (_: Exception) {
         }
 
-        try {
-            tone?.release()
-        } catch (_: Exception) {
-        }
+        threadToStop
+            ?.takeUnless { it === Thread.currentThread() }
+            ?.interrupt()
 
-        tone = null
+        releaseAlertAudioFocus()
+        handler.removeCallbacksAndMessages(null)
 
         if (wasReading) {
             sendUpdate(
