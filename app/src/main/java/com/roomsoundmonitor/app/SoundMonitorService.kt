@@ -67,13 +67,12 @@ class SoundMonitorService : Service() {
     private var recorder: AudioRecord? = null
 
     private var worker: Thread? = null
-    private var tone: ToneGenerator? = null
-
     private val audioFocusLock = Any()
     private var activeAudioManager: AudioManager? = null
     private var activeFocusRequest: AudioFocusRequest? = null
     private var activeFocusListener: AudioManager.OnAudioFocusChangeListener? = null
     private var alertReleaseRunnable: Runnable? = null
+    private var activeTone: ToneGenerator? = null
     private var nextAlertId = 0L
     private var activeAlertId = 0L
 
@@ -782,17 +781,16 @@ class SoundMonitorService : Service() {
                     )
                 }
 
-                try {
-                    tone?.release()
-                } catch (_: Exception) {
-                }
-
-                tone = ToneGenerator(
+                val newTone = ToneGenerator(
                     AudioManager.STREAM_MUSIC,
                     90
                 )
 
-                tone?.startTone(
+                synchronized(audioFocusLock) {
+                    activeTone = newTone
+                }
+
+                newTone.startTone(
                     ToneGenerator.TONE_PROP_BEEP,
                     450
                 )
@@ -824,6 +822,7 @@ class SoundMonitorService : Service() {
         val request: AudioFocusRequest?
         val listener: AudioManager.OnAudioFocusChangeListener?
         val releaseRunnable: Runnable?
+        val toneToRelease: ToneGenerator?
 
         synchronized(audioFocusLock) {
             if (expectedAlertId != null && activeAlertId != expectedAlertId) {
@@ -834,10 +833,12 @@ class SoundMonitorService : Service() {
             request = activeFocusRequest
             listener = activeFocusListener
             releaseRunnable = alertReleaseRunnable
+            toneToRelease = activeTone
             activeAudioManager = null
             activeFocusRequest = null
             activeFocusListener = null
             alertReleaseRunnable = null
+            activeTone = null
             activeAlertId = 0L
         }
 
@@ -851,8 +852,7 @@ class SoundMonitorService : Service() {
         }
 
         try {
-            tone?.release()
-            tone = null
+            toneToRelease?.release()
         } catch (_: Exception) {
         }
     }
@@ -1090,7 +1090,6 @@ class SoundMonitorService : Service() {
             ?.interrupt()
 
         releaseAlertAudioFocus()
-        tone = null
         handler.removeCallbacksAndMessages(null)
 
         if (wasReading) {
