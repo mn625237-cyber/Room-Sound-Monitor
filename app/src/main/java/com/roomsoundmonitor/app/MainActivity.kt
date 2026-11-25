@@ -27,6 +27,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -59,6 +60,9 @@ class MainActivity : AppCompatActivity() {
     private var receiverRegistered = false
     private var currentTab = TAB_MONITOR
     private var historyFilter = FILTER_ALL
+    private val scrollPositions = mutableMapOf<Int, Int>()
+    private var activeScrollView: ScrollView? = null
+    private var renderedTab = TAB_MONITOR
 
     private var monitorStatusText: TextView? = null
     private var monitorStatusDot: TextView? = null
@@ -110,7 +114,10 @@ class MainActivity : AppCompatActivity() {
             if (intent.getBooleanExtra("history", false)) {
                 alertItem = latestHistoryItem() ?: alertItem
             }
-            refreshRenderedState()
+            refreshRenderedState(
+                renderTab = intent.getBooleanExtra("alert", false) ||
+                    (currentTab == TAB_ALERT && intent.getBooleanExtra("history", false))
+            )
         }
     }
 
@@ -118,6 +125,16 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         applyAppearance()
         buildShell()
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (currentTab != TAB_MONITOR) {
+                    currentTab = TAB_MONITOR
+                    renderCurrentTab()
+                } else {
+                    finish()
+                }
+            }
+        })
         refreshFromPreferences()
         renderCurrentTab()
     }
@@ -183,14 +200,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderCurrentTab() {
         if (!::screenContainer.isInitialized) return
+        activeScrollView?.let { scrollPositions[renderedTab] = it.scrollY }
         screenContainer.removeAllViews()
+        activeScrollView = null
         when (currentTab) {
             TAB_ALERT -> renderAlertScreen()
             TAB_HISTORY -> renderHistoryScreen()
             TAB_SETTINGS -> renderSettingsScreen()
             else -> renderMonitorScreen()
         }
+        renderedTab = currentTab
         updateBottomNavigation()
+        activeScrollView?.let { scroll ->
+            screenContainer.post { scroll.scrollTo(0, scrollPositions[currentTab] ?: 0) }
+        }
     }
 
     private fun renderMonitorScreen() {
@@ -198,10 +221,11 @@ class MainActivity : AppCompatActivity() {
             isFillViewport = true
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
+        activeScrollView = scroll
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(16), dp(18), dp(16), dp(20))
+            setPadding(dp(16), dp(18), dp(16), dp(36))
             setBackgroundColor(this@MainActivity.background)
         }
 
@@ -268,11 +292,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderAlertScreen() {
         val scroll = ScrollView(this).apply { isFillViewport = true }
+        activeScrollView = scroll
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(24), dp(16), dp(24))
+            setPadding(dp(16), dp(24), dp(16), dp(36))
             setBackgroundColor(this@MainActivity.background)
         }
         content.addView(makeHeader("تنبيه اكتشاف صوت", "مراجعة الحدث الأخير"), fullWidth())
@@ -317,10 +342,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderHistoryScreen() {
         val scroll = ScrollView(this).apply { isFillViewport = true }
+        activeScrollView = scroll
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(16), dp(18), dp(16), dp(20))
+            setPadding(dp(16), dp(18), dp(16), dp(36))
             setBackgroundColor(this@MainActivity.background)
         }
         content.addView(makeHeader("سجل الأحداث", "الأحداث التي رصدها التطبيق محليًا"), fullWidth())
@@ -340,6 +366,10 @@ class MainActivity : AppCompatActivity() {
         }
         content.addView(filters, fullWidth())
         addSpace(content, 16)
+        val clearHistory = makeSecondaryButton("مسح السجل")
+        clearHistory.setOnClickListener { showClearHistoryConfirmation() }
+        content.addView(clearHistory, fullWidth())
+        addSpace(content, 16)
         val history = filteredHistory()
         if (history.isEmpty()) {
             val empty = makeCard()
@@ -355,10 +385,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderSettingsScreen() {
         val scroll = ScrollView(this).apply { isFillViewport = true }
+        activeScrollView = scroll
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(16), dp(18), dp(16), dp(20))
+            setPadding(dp(16), dp(18), dp(16), dp(36))
             setBackgroundColor(this@MainActivity.background)
         }
         content.addView(makeHeader("الإعدادات", "اضبط تجربة التنبيه والمراقبة"), fullWidth())
@@ -451,11 +482,7 @@ class MainActivity : AppCompatActivity() {
         addSpace(content, 16)
 
         val clear = makeSecondaryButton("مسح سجل الأحداث")
-        clear.setOnClickListener {
-            getSharedPreferences(prefsName, MODE_PRIVATE).edit().putString(SoundMonitorService.KEY_HISTORY, "[]").apply()
-            showToast("تم مسح سجل الأحداث")
-            renderCurrentTab()
-        }
+        clear.setOnClickListener { showClearHistoryConfirmation() }
         content.addView(clear, fullWidth())
 
         scroll.addView(content)
@@ -516,6 +543,27 @@ class MainActivity : AppCompatActivity() {
             return
         }
         items.forEach { container.addView(makeHistoryCard(it), fullWidth()) }
+    }
+
+    private fun showClearHistoryConfirmation() {
+        AlertDialog.Builder(this)
+            .setTitle("مسح سجل الأحداث؟")
+            .setMessage("سيتم حذف جميع الأحداث المحفوظة. لا يمكن التراجع عن هذا الإجراء.")
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("مسح السجل") { _, _ ->
+                getSharedPreferences(prefsName, MODE_PRIVATE)
+                    .edit()
+                    .putString(SoundMonitorService.KEY_HISTORY, "[]")
+                    .remove("last_alert")
+                    .apply()
+                currentEvent = "لا يوجد اكتشاف بعد"
+                currentAlert = "لا توجد تنبيهات جديدة"
+                alertItem = null
+                showToast("تم مسح سجل الأحداث")
+                refreshFromPreferences()
+                renderCurrentTab()
+            }
+            .show()
     }
 
     private fun makeHeader(title: String, subtitle: String): LinearLayout {
@@ -619,19 +667,25 @@ class MainActivity : AppCompatActivity() {
                     renderCurrentTab()
                 }
             }
-            item.addView(makeText(icon, 22f, if (selected) selectedIcon else secondaryText, true), LinearLayout.LayoutParams(-1, dp(28)))
-            item.addView(makeText(label, 12f, if (selected) selectedIcon else secondaryText, selected), LinearLayout.LayoutParams(-1, dp(28)))
+            val iconText = makeText(icon, 22f, if (selected) selectedIcon else secondaryText, true).apply {
+                gravity = Gravity.CENTER
+            }
+            val labelText = makeText(label, 12f, if (selected) selectedIcon else secondaryText, selected).apply {
+                gravity = Gravity.CENTER
+            }
+            item.addView(iconText, LinearLayout.LayoutParams(-1, dp(28)))
+            item.addView(labelText, LinearLayout.LayoutParams(-1, dp(28)))
             bottomNavigation.addView(item, weightedButtonParams())
         }
     }
 
-    private fun refreshRenderedState() {
+    private fun refreshRenderedState(renderTab: Boolean = false) {
         if (!::screenContainer.isInitialized) return
         syncMonitorVisualState()
         monitorLevelText?.text = "مستوى الصوت: $currentDb dB"
         monitorLastText?.text = currentEvent
         monitorEventsContainer?.let { renderRecentEvents(it, 5) }
-        if (currentTab == TAB_HISTORY || currentTab == TAB_SETTINGS || currentTab == TAB_ALERT) renderCurrentTab()
+        if (renderTab) renderCurrentTab()
     }
 
     private fun refreshFromPreferences() {
