@@ -45,6 +45,8 @@ class SoundMonitorService : Service() {
         const val KEY_ACTIVE = "monitoring_active"
         const val KEY_HISTORY = "events_json"
         const val KEY_SENSITIVITY = "sensitivity"
+        const val KEY_ALERT_SOUND = "alert_sound"
+        const val KEY_ALERT_VIBRATION = "alert_vibration"
 
         @Volatile
         var serviceRunning = false
@@ -714,9 +716,25 @@ class SoundMonitorService : Service() {
 
     private fun playAlert(currentSession: Long) {
 
+        val soundEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(KEY_ALERT_SOUND, true)
+        val vibrationEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(KEY_ALERT_VIBRATION, true)
+
         try {
 
             releaseAlertAudioFocus()
+
+            if (!soundEnabled) {
+                if (vibrationEnabled) {
+                    synchronized(lifecycleLock) {
+                        if (!destroyed && isSessionActive(currentSession)) {
+                            vibrate()
+                        }
+                    }
+                }
+                return
+            }
 
             synchronized(lifecycleLock) {
                 if (destroyed || !isSessionActive(currentSession)) return
@@ -795,7 +813,9 @@ class SoundMonitorService : Service() {
                     450
                 )
 
-                vibrate()
+                if (vibrationEnabled) {
+                    vibrate()
+                }
 
                 val releaseRunnable = Runnable {
                     releaseAlertAudioFocus(alertId)
@@ -810,7 +830,11 @@ class SoundMonitorService : Service() {
         } catch (_: Exception) {
             releaseAlertAudioFocus()
             synchronized(lifecycleLock) {
-                if (!destroyed && isSessionActive(currentSession)) {
+                if (
+                    vibrationEnabled &&
+                    !destroyed &&
+                    isSessionActive(currentSession)
+                ) {
                     vibrate()
                 }
             }
