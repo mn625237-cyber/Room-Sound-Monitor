@@ -153,6 +153,9 @@ dependencies {
 
     // TensorFlow Lite Audio
     implementation(libs.tensorflow.lite.task.audio)
+    // TensorFlow Lite 0.4.4 declares these annotations as provided; R8 needs
+    // the annotation classes available when shrinking the release artifact.
+    implementation(libs.auto.value.annotations)
 
     testImplementation(libs.junit)
 }
