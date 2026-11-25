@@ -24,8 +24,8 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -143,19 +143,12 @@ class MainActivity : AppCompatActivity() {
             val filter =
                 IntentFilter(SoundMonitorService.ACTION_UPDATE)
 
-            if (Build.VERSION.SDK_INT >= 33) {
-
-                registerReceiver(
-                    receiver,
-                    filter,
-                    Context.RECEIVER_NOT_EXPORTED
-                )
-
-            } else {
-
-                @Suppress("DEPRECATION")
-                registerReceiver(receiver, filter)
-            }
+            ContextCompat.registerReceiver(
+                this,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
 
             receiverRegistered = true
         }
