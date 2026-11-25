@@ -61,11 +61,12 @@ class MainActivity : AppCompatActivity() {
     private var historyFilter = FILTER_ALL
 
     private var monitorStatusText: TextView? = null
+    private var monitorStatusDot: TextView? = null
+    private var monitorMicrophone: ImageView? = null
     private var monitorLevelText: TextView? = null
     private var monitorLastText: TextView? = null
     private var monitorActionButton: Button? = null
     private var monitorEventsContainer: LinearLayout? = null
-    private var monitorAlertContainer: LinearLayout? = null
 
     private var currentDb = -90
     private var currentEvent = "لا يوجد اكتشاف بعد"
@@ -104,6 +105,10 @@ class MainActivity : AppCompatActivity() {
             if (intent.getBooleanExtra("alert", false)) {
                 currentAlert = "تم اكتشاف صوت"
                 alertItem = latestHistoryItem()
+                currentTab = TAB_ALERT
+            }
+            if (intent.getBooleanExtra("history", false)) {
+                alertItem = latestHistoryItem() ?: alertItem
             }
             refreshRenderedState()
         }
@@ -180,6 +185,7 @@ class MainActivity : AppCompatActivity() {
         if (!::screenContainer.isInitialized) return
         screenContainer.removeAllViews()
         when (currentTab) {
+            TAB_ALERT -> renderAlertScreen()
             TAB_HISTORY -> renderHistoryScreen()
             TAB_SETTINGS -> renderSettingsScreen()
             else -> renderMonitorScreen()
@@ -213,6 +219,7 @@ class MainActivity : AppCompatActivity() {
             contentDescription = "حالة الميكروفون"
             setColorFilter(if (isActive()) activeGreen else Color.rgb(125, 125, 125))
         }
+        monitorMicrophone = microphone
         statusRow.addView(microphone, LinearLayout.LayoutParams(dp(64), dp(64)))
         val statusTextColumn = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -223,6 +230,7 @@ class MainActivity : AppCompatActivity() {
         monitorStatusText = statusTitle
         statusTextColumn.addView(statusTitle, fullWidth())
         val dot = makeText(if (isActive()) "● تعمل الآن" else "● غير نشطة", 14f, if (isActive()) activeGreen else secondaryText)
+        monitorStatusDot = dot
         statusTextColumn.addView(dot, fullWidth())
         statusRow.addView(statusTextColumn, LinearLayout.LayoutParams(0, dp(76), 1f))
         statusCard.addView(statusRow, fullWidth())
@@ -246,13 +254,6 @@ class MainActivity : AppCompatActivity() {
         content.addView(lastCard, fullWidth())
         addSpace(content, 16)
 
-        monitorAlertContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        content.addView(monitorAlertContainer, fullWidth())
-        renderAlertCardIfNeeded()
-
         content.addView(makeSectionTitle("الأحداث الأخيرة"), fullWidth())
         monitorEventsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -265,10 +266,24 @@ class MainActivity : AppCompatActivity() {
         screenContainer.addView(scroll, FrameLayout.LayoutParams(-1, -1))
     }
 
-    private fun renderAlertCardIfNeeded() {
-        val container = monitorAlertContainer ?: return
-        container.removeAllViews()
-        val item = alertItem ?: return
+    private fun renderAlertScreen() {
+        val scroll = ScrollView(this).apply { isFillViewport = true }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(24))
+            setBackgroundColor(this@MainActivity.background)
+        }
+        content.addView(makeHeader("تنبيه اكتشاف صوت", "مراجعة الحدث الأخير"), fullWidth())
+        addSpace(content, 24)
+        val item = alertItem ?: latestHistoryItem()
+        if (item == null) {
+            val empty = makeCard()
+            empty.addView(makeText("لا يوجد تنبيه حالي", 18f, primaryText, true), fullWidth())
+            empty.addView(makeText("ستظهر التنبيهات هنا عند اكتشاف صوت مؤهل.", 14f, secondaryText), fullWidth())
+            content.addView(empty, fullWidth())
+        } else {
         val card = makeCard(warningAmber)
         card.addView(makeSectionTitle("تم اكتشاف صوت"), fullWidth())
         card.addView(makeText(item.name, 19f, primaryText, true), fullWidth())
@@ -288,13 +303,16 @@ class MainActivity : AppCompatActivity() {
         val dismiss = makeSecondaryButton("إغلاق التنبيه")
         dismiss.setOnClickListener {
             alertItem = null
-            renderAlertCardIfNeeded()
+            currentTab = TAB_MONITOR
+            renderCurrentTab()
         }
         actions.addView(details, weightedButtonParams())
         actions.addView(dismiss, weightedButtonParams())
         card.addView(actions, fullWidth())
-        container.addView(card, fullWidth())
-        addSpace(container, 16)
+            content.addView(card, fullWidth())
+        }
+        scroll.addView(content)
+        screenContainer.addView(scroll, FrameLayout.LayoutParams(-1, -1))
     }
 
     private fun renderHistoryScreen() {
@@ -404,7 +422,18 @@ class MainActivity : AppCompatActivity() {
         val categoriesCard = makeCard()
         categoriesCard.addView(makeSectionTitle("أنواع الأصوات المدعومة"), fullWidth())
         categoriesCard.addView(makeText("الفئات التالية هي الفئات التي يعرّفها نظام التصنيف الحالي:", 14f, secondaryText), fullWidth())
-        categoriesCard.addView(makeText("كلام بشري • صراخ • تصفيق • طرق ونقر • ارتطام • إنذارات • أجراس وأصوات أبواب", 15f, primaryText), fullWidth())
+        listOf(
+            SoundMonitorService.KEY_CATEGORY_SPEECH to "كلام بشري",
+            SoundMonitorService.KEY_CATEGORY_SHOUT to "صراخ",
+            SoundMonitorService.KEY_CATEGORY_CLAP to "تصفيق",
+            SoundMonitorService.KEY_CATEGORY_KNOCK to "طرق ونقر",
+            SoundMonitorService.KEY_CATEGORY_IMPACT to "ارتطام",
+            SoundMonitorService.KEY_CATEGORY_ALARM to "إنذارات",
+            SoundMonitorService.KEY_CATEGORY_DOORBELL to "جرس الباب",
+            SoundMonitorService.KEY_CATEGORY_DOOR to "أصوات الأبواب"
+        ).forEach { (key, label) ->
+            addCategorySwitch(categoriesCard, label, key)
+        }
         content.addView(categoriesCard, fullWidth())
         addSpace(content, 16)
 
@@ -453,6 +482,10 @@ class MainActivity : AppCompatActivity() {
         parent.addView(row, fullWidth())
     }
 
+    private fun addCategorySwitch(parent: LinearLayout, label: String, key: String) {
+        addSettingSwitch(parent, label, key, true)
+    }
+
     private fun makeHistoryCard(item: HistoryItem): LinearLayout {
         val card = makeCard()
         val row = LinearLayout(this).apply {
@@ -474,7 +507,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderRecentEvents(container: LinearLayout, limit: Int) {
         container.removeAllViews()
-        val items = filteredHistory().take(limit)
+        val items = readHistory().take(limit)
         if (items.isEmpty()) {
             val empty = makeCard()
             empty.addView(makeText("لا توجد أحداث بعد", 16f, primaryText, true), fullWidth())
@@ -571,7 +604,7 @@ class MainActivity : AppCompatActivity() {
             val tab = entry.first
             val label = entry.second
             val icon = entry.third
-            val selected = tab == currentTab
+            val selected = tab == if (currentTab == TAB_ALERT) TAB_MONITOR else currentTab
             val item = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
@@ -594,19 +627,33 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshRenderedState() {
         if (!::screenContainer.isInitialized) return
-        monitorStatusText?.text = if (isActive()) "المراقبة نشطة" else "المراقبة متوقفة"
+        syncMonitorVisualState()
         monitorLevelText?.text = "مستوى الصوت: $currentDb dB"
         monitorLastText?.text = currentEvent
-        monitorActionButton?.text = if (isActive()) "إيقاف المراقبة" else "بدء المراقبة"
-        renderAlertCardIfNeeded()
         monitorEventsContainer?.let { renderRecentEvents(it, 5) }
-        if (currentTab == TAB_HISTORY || currentTab == TAB_SETTINGS) renderCurrentTab()
+        if (currentTab == TAB_HISTORY || currentTab == TAB_SETTINGS || currentTab == TAB_ALERT) renderCurrentTab()
     }
 
     private fun refreshFromPreferences() {
         val last = getSharedPreferences(prefsName, MODE_PRIVATE).getString("last_alert", null)
         if (!last.isNullOrBlank()) currentAlert = last
-        if (!isActive() && alertItem != null) alertItem = null
+        val latest = latestHistoryItem()
+        currentEvent = latest?.let { "${it.name} — ${it.score}%" } ?: "لا يوجد اكتشاف بعد"
+        if (!isActive() && currentTab != TAB_ALERT) alertItem = null
+        syncMonitorVisualState()
+    }
+
+    private fun syncMonitorVisualState() {
+        val active = isActive()
+        monitorStatusText?.text = if (active) "المراقبة نشطة" else "المراقبة متوقفة"
+        monitorStatusDot?.apply {
+            text = if (active) "● تعمل الآن" else "● غير نشطة"
+            setTextColor(if (active) activeGreen else secondaryText)
+        }
+        monitorMicrophone?.setColorFilter(
+            if (active) activeGreen else Color.rgb(125, 125, 125)
+        )
+        monitorActionButton?.text = if (active) "إيقاف المراقبة" else "بدء المراقبة"
     }
 
     private fun requestPermissionsAndStart() {
@@ -632,7 +679,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopMonitoring() {
         startService(Intent(this, SoundMonitorService::class.java).setAction(SoundMonitorService.ACTION_STOP))
-        currentEvent = "لا يوجد اكتشاف بعد"
         currentDb = -90
         alertItem = null
         refreshRenderedState()
@@ -723,6 +769,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_MONITOR = 0
         private const val TAB_HISTORY = 1
         private const val TAB_SETTINGS = 2
+        private const val TAB_ALERT = 3
         private const val FILTER_ALL = 0
         private const val FILTER_HIGH = 1
         private const val FILTER_TODAY = 2

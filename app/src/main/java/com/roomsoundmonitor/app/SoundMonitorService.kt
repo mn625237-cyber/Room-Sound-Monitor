@@ -47,6 +47,14 @@ class SoundMonitorService : Service() {
         const val KEY_SENSITIVITY = "sensitivity"
         const val KEY_ALERT_SOUND = "alert_sound"
         const val KEY_ALERT_VIBRATION = "alert_vibration"
+        const val KEY_CATEGORY_SPEECH = "category_speech"
+        const val KEY_CATEGORY_SHOUT = "category_shout"
+        const val KEY_CATEGORY_CLAP = "category_clap"
+        const val KEY_CATEGORY_KNOCK = "category_knock"
+        const val KEY_CATEGORY_IMPACT = "category_impact"
+        const val KEY_CATEGORY_ALARM = "category_alarm"
+        const val KEY_CATEGORY_DOORBELL = "category_doorbell"
+        const val KEY_CATEGORY_DOOR = "category_door"
 
         @Volatile
         var serviceRunning = false
@@ -433,6 +441,10 @@ class SoundMonitorService : Service() {
                     getEventInfo(label)
                         ?: return@mapNotNull null
 
+                if (!isCategoryEnabled(info.group)) {
+                    return@mapNotNull null
+                }
+
                 val threshold =
                     info.threshold * factor
 
@@ -536,6 +548,23 @@ class SoundMonitorService : Service() {
 
             else -> null
         }
+    }
+
+    private fun isCategoryEnabled(group: String): Boolean {
+        val key = when (group) {
+            "speech" -> KEY_CATEGORY_SPEECH
+            "shout" -> KEY_CATEGORY_SHOUT
+            "clap" -> KEY_CATEGORY_CLAP
+            "knock" -> KEY_CATEGORY_KNOCK
+            "impact" -> KEY_CATEGORY_IMPACT
+            "alarm" -> KEY_CATEGORY_ALARM
+            "doorbell" -> KEY_CATEGORY_DOORBELL
+            "door" -> KEY_CATEGORY_DOOR
+            else -> return true
+        }
+
+        return getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(key, true)
     }
 
     private fun processEvent(
