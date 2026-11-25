@@ -29,9 +29,8 @@ android {
     namespace = "com.roomsoundmonitor.app"
     compileSdk = 36 
     
-    // disable linter
     lint {
-        checkReleaseBuilds = false
+        checkReleaseBuilds = true
     }
         
     signingConfigs {
@@ -63,7 +62,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            isDebuggable = true
+        }
+
         release {
+            isDebuggable = false
             if (hasValidSigningProps) {
                 signingConfig = signingConfigs.getByName("release")
             }
