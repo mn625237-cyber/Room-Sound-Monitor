@@ -21,6 +21,7 @@ import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,10 +46,31 @@ class SoundMonitorService : Service() {
         const val KEY_ACTIVE = "monitoring_active"
         const val KEY_HISTORY = "events_json"
         const val KEY_SENSITIVITY = "sensitivity"
+        const val KEY_ALERT_SOUND = "alert_sound"
+        const val KEY_ALERT_VIBRATION = "alert_vibration"
+        const val KEY_CATEGORY_SPEECH = "category_speech"
+        const val KEY_CATEGORY_SHOUT = "category_shout"
+        const val KEY_CATEGORY_CLAP = "category_clap"
+        const val KEY_CATEGORY_KNOCK = "category_knock"
+        const val KEY_CATEGORY_IMPACT = "category_impact"
+        const val KEY_CATEGORY_ALARM = "category_alarm"
+        const val KEY_CATEGORY_DOORBELL = "category_doorbell"
+        const val KEY_CATEGORY_DOOR = "category_door"
+        const val KEY_CATEGORY_CRYING = "category_crying"
+        const val KEY_CATEGORY_PHONE = "category_phone"
+        const val KEY_CATEGORY_SIREN = "category_siren"
+        const val KEY_CATEGORY_HORN = "category_horn"
+        const val KEY_CATEGORY_FOOTSTEPS = "category_footsteps"
+        const val KEY_CATEGORY_BELL = "category_bell"
+        const val KEY_CATEGORY_SIGNAL = "category_signal"
+
+        val HISTORY_LOCK = Any()
 
         @Volatile
         var serviceRunning = false
             private set
+
+        private const val TAG = "SoundMonitorService"
     }
 
     @Volatile
@@ -91,14 +113,16 @@ class SoundMonitorService : Service() {
         val group: String,
         val name: String,
         val threshold: Float,
-        val alert: Boolean
+        val alert: Boolean,
+        val confirmationHits: Int = 2
     )
 
     private data class DetectedEvent(
         val group: String,
         val name: String,
         val score: Float,
-        val alert: Boolean
+        val alert: Boolean,
+        val confirmationHits: Int
     )
 
     override fun onCreate() {
@@ -172,9 +196,10 @@ class SoundMonitorService : Service() {
                 getSharedPreferences(PREFS, MODE_PRIVATE)
                     .edit()
                     .putBoolean(KEY_ACTIVE, false)
-                    .remove("last_alert")
                     .apply()
             }
+
+            clearLastAlert()
 
             sendUpdate(
                 status = "متوقف",
@@ -431,6 +456,10 @@ class SoundMonitorService : Service() {
                     getEventInfo(label)
                         ?: return@mapNotNull null
 
+                if (!isCategoryEnabled(info.group)) {
+                    return@mapNotNull null
+                }
+
                 val threshold =
                     info.threshold * factor
 
@@ -442,7 +471,8 @@ class SoundMonitorService : Service() {
                     info.group,
                     info.name,
                     category.score,
-                    info.alert
+                    info.alert,
+                    info.confirmationHits
                 )
             }
             .maxByOrNull { it.score }
@@ -467,6 +497,14 @@ class SoundMonitorService : Service() {
                     "speech", "ضوضاء كلام", 0.35f, false
                 )
 
+            "crying, sobbing" -> EventInfo(
+                "crying", "بكاء", 0.30f, true
+            )
+
+            "baby cry, infant cry" -> EventInfo(
+                "crying", "بكاء طفل", 0.30f, true
+            )
+
             "shout" -> EventInfo(
                 "shout", "صراخ", 0.25f, true
             )
@@ -483,6 +521,10 @@ class SoundMonitorService : Service() {
                 "clap", "تصفيق", 0.25f, true
             )
 
+            "walk, footsteps" -> EventInfo(
+                "footsteps", "خطوات مشي", 0.40f, false
+            )
+
             "knock" -> EventInfo(
                 "knock", "طرق", 0.25f, true
             )
@@ -492,11 +534,11 @@ class SoundMonitorService : Service() {
             )
 
             "thump, thud" -> EventInfo(
-                "impact", "ارتطام مكتوم", 0.25f, true
+                "impact", "ارتطام مكتوم", 0.25f, true, confirmationHits = 1
             )
 
             "bang" -> EventInfo(
-                "impact", "ضربة قوية", 0.25f, true
+                "impact", "ضربة قوية", 0.25f, true, confirmationHits = 1
             )
 
             "alarm" -> EventInfo(
@@ -520,6 +562,42 @@ class SoundMonitorService : Service() {
                 "alarm", "إنذار سيارة", 0.25f, true
             )
 
+            "telephone bell ringing" -> EventInfo(
+                "phone", "رنين هاتف", 0.30f, true
+            )
+
+            "ringtone" -> EventInfo(
+                "phone", "نغمة رنين", 0.30f, true
+            )
+
+            "siren" -> EventInfo(
+                "siren", "صفارة إنذار", 0.25f, true
+            )
+
+            "civil defense siren" -> EventInfo(
+                "siren", "صفارة دفاع مدني", 0.25f, true
+            )
+
+            "police car (siren)" -> EventInfo(
+                "siren", "صفارة شرطة", 0.25f, true
+            )
+
+            "ambulance (siren)" -> EventInfo(
+                "siren", "صفارة إسعاف", 0.25f, true
+            )
+
+            "fire engine, fire truck (siren)" -> EventInfo(
+                "siren", "صفارة سيارة إطفاء", 0.25f, true
+            )
+
+            "vehicle horn, car horn, honking" -> EventInfo(
+                "horn", "بوق سيارة", 0.30f, true
+            )
+
+            "air horn, truck horn" -> EventInfo(
+                "horn", "بوق شاحنة", 0.30f, true
+            )
+
             "doorbell" -> EventInfo(
                 "doorbell", "جرس باب", 0.30f, true
             )
@@ -532,8 +610,64 @@ class SoundMonitorService : Service() {
                 "door", "باب منزلق", 0.35f, false
             )
 
+            "bell" -> EventInfo(
+                "bell", "جرس", 0.35f, false
+            )
+
+            "church bell" -> EventInfo(
+                "bell", "جرس كنيسة", 0.35f, false
+            )
+
+            "jingle bell" -> EventInfo(
+                "bell", "جرس صغير", 0.35f, false
+            )
+
+            "bicycle bell" -> EventInfo(
+                "bell", "جرس دراجة", 0.35f, false
+            )
+
+            "buzzer" -> EventInfo(
+                "signal", "بازر", 0.30f, false
+            )
+
+            "whistle" -> EventInfo(
+                "signal", "صفير", 0.35f, false
+            )
+
+            "smash, crash" -> EventInfo(
+                "impact", "تحطم أو اصطدام", 0.25f, true, confirmationHits = 1
+            )
+
+            "glass" -> EventInfo(
+                "impact", "صوت زجاج", 0.40f, false
+            )
+
             else -> null
         }
+    }
+
+    private fun isCategoryEnabled(group: String): Boolean {
+        val key = when (group) {
+            "speech" -> KEY_CATEGORY_SPEECH
+            "shout" -> KEY_CATEGORY_SHOUT
+            "clap" -> KEY_CATEGORY_CLAP
+            "knock" -> KEY_CATEGORY_KNOCK
+            "impact" -> KEY_CATEGORY_IMPACT
+            "alarm" -> KEY_CATEGORY_ALARM
+            "doorbell" -> KEY_CATEGORY_DOORBELL
+            "door" -> KEY_CATEGORY_DOOR
+            "crying" -> KEY_CATEGORY_CRYING
+            "phone" -> KEY_CATEGORY_PHONE
+            "siren" -> KEY_CATEGORY_SIREN
+            "horn" -> KEY_CATEGORY_HORN
+            "footsteps" -> KEY_CATEGORY_FOOTSTEPS
+            "bell" -> KEY_CATEGORY_BELL
+            "signal" -> KEY_CATEGORY_SIGNAL
+            else -> return true
+        }
+
+        return getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(key, true)
     }
 
     private fun processEvent(
@@ -568,7 +702,7 @@ class SoundMonitorService : Service() {
 
         var shouldAlert = false
 
-        if (event.alert && hits >= 2) {
+        if (event.alert && hits >= event.confirmationHits) {
 
             val previous =
                 lastAlerts[event.group] ?: 0L
@@ -579,48 +713,48 @@ class SoundMonitorService : Service() {
             }
         }
 
-        val eventLabel =
-            "${event.name} — $percentage%"
-
-        sendUpdate(
-            eventName = eventLabel,
-            alert = shouldAlert
-        )
-
+        val eventTime = System.currentTimeMillis()
+        val eventId = "$eventTime-${event.group}-${event.name}"
         val shouldLog =
-            event.name != lastLoggedName ||
-                now - lastLoggedTime >= 5000L
+            shouldPersistEvent(
+                isAlert = shouldAlert,
+                nameChanged = event.name != lastLoggedName,
+                elapsedSinceLastLog = now - lastLoggedTime
+            )
 
         if (shouldLog) {
-
             lastLoggedName = event.name
             lastLoggedTime = now
-
             saveEvent(
-                event.name,
-                percentage,
-                shouldAlert
+                eventId = eventId,
+                name = event.name,
+                score = percentage,
+                alert = shouldAlert,
+                eventTime = eventTime
             )
         }
 
+        val eventLabel = "${event.name} — $percentage%"
+        sendUpdate(
+            eventName = eventLabel,
+            alert = shouldAlert,
+            alertEventId = if (shouldAlert) eventId else null,
+            alertName = if (shouldAlert) event.name else null,
+            alertScore = if (shouldAlert) percentage else null,
+            alertTime = if (shouldAlert) eventTime else null
+        )
+
         if (shouldAlert && isSessionActive(currentSession)) {
-
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(
-                    "last_alert",
-                    "تنبيه: ${event.name}"
-                )
-                .apply()
-
             playAlert(currentSession)
         }
     }
 
     private fun saveEvent(
+        eventId: String,
         name: String,
         score: Int,
-        alert: Boolean
+        alert: Boolean,
+        eventTime: Long
     ) {
 
         val prefs = getSharedPreferences(
@@ -628,34 +762,43 @@ class SoundMonitorService : Service() {
             MODE_PRIVATE
         )
 
-        val old = try {
-            JSONArray(
-                prefs.getString(KEY_HISTORY, "[]")
-            )
-        } catch (_: Exception) {
-            JSONArray()
-        }
-
-        val updated = JSONArray()
-
-        updated.put(
-            JSONObject().apply {
-                put("name", name)
-                put("score", score)
-                put("alert", alert)
-                put("time", System.currentTimeMillis())
+        synchronized(HISTORY_LOCK) {
+            val old = try {
+                JSONArray(prefs.getString(KEY_HISTORY, "[]"))
+            } catch (_: Exception) {
+                JSONArray()
             }
-        )
 
-        for (i in 0 until minOf(old.length(), 19)) {
-            updated.put(old.getJSONObject(i))
+            val updated = JSONArray()
+            updated.put(
+                JSONObject().apply {
+                    put("id", eventId)
+                    put("name", name)
+                    put("score", score)
+                    put("alert", alert)
+                    put("time", eventTime)
+                }
+            )
+
+            for (i in 0 until minOf(old.length(), 19)) {
+                updated.put(old.getJSONObject(i))
+            }
+
+            val editor = prefs.edit().putString(KEY_HISTORY, updated.toString())
+            if (alert) editor.putString("last_alert", "تنبيه: $name")
+            editor.apply()
         }
-
-        prefs.edit()
-            .putString(KEY_HISTORY, updated.toString())
-            .apply()
 
         sendUpdate(historyChanged = true)
+    }
+
+    private fun clearLastAlert() {
+        synchronized(HISTORY_LOCK) {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .remove("last_alert")
+                .apply()
+        }
     }
 
     private fun isSessionActive(expectedSession: Long): Boolean {
@@ -670,8 +813,9 @@ class SoundMonitorService : Service() {
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_ACTIVE, true)
-                .remove("last_alert")
                 .apply()
+
+            clearLastAlert()
 
             // Publish while holding the lifecycle lock so stopMonitoring()
             // cannot invalidate this state between the check and the broadcast.
@@ -688,8 +832,9 @@ class SoundMonitorService : Service() {
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_ACTIVE, false)
-                .remove("last_alert")
                 .apply()
+
+            clearLastAlert()
         }
     }
 
@@ -698,8 +843,10 @@ class SoundMonitorService : Service() {
         message: String
     ) {
         handler.post {
-            if (!isSessionActive(expectedSession)) return@post
-            updateNotification(message)
+            synchronized(lifecycleLock) {
+                if (!isSessionActive(expectedSession)) return@synchronized
+                updateNotification(message)
+            }
         }
     }
 
@@ -714,9 +861,25 @@ class SoundMonitorService : Service() {
 
     private fun playAlert(currentSession: Long) {
 
+        val soundEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(KEY_ALERT_SOUND, true)
+        val vibrationEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(KEY_ALERT_VIBRATION, true)
+
         try {
 
             releaseAlertAudioFocus()
+
+            if (!soundEnabled) {
+                if (vibrationEnabled) {
+                    synchronized(lifecycleLock) {
+                        if (!destroyed && isSessionActive(currentSession)) {
+                            vibrate()
+                        }
+                    }
+                }
+                return
+            }
 
             synchronized(lifecycleLock) {
                 if (destroyed || !isSessionActive(currentSession)) return
@@ -770,7 +933,7 @@ class SoundMonitorService : Service() {
                     activeAlertId = alertId
                 }
 
-                if (Build.VERSION.SDK_INT >= 26) {
+                val focusResult = if (Build.VERSION.SDK_INT >= 26) {
                     audioManager.requestAudioFocus(focusRequest!!)
                 } else {
                     @Suppress("DEPRECATION")
@@ -779,6 +942,15 @@ class SoundMonitorService : Service() {
                         AudioManager.STREAM_MUSIC,
                         AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                     )
+                }
+
+                if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                    Log.w(TAG, "Audio focus unavailable; using vibration fallback")
+                    releaseAlertAudioFocus(alertId)
+                    if (vibrationEnabled && !destroyed && isSessionActive(currentSession)) {
+                        vibrate()
+                    }
+                    return
                 }
 
                 val newTone = ToneGenerator(
@@ -795,7 +967,9 @@ class SoundMonitorService : Service() {
                     450
                 )
 
-                vibrate()
+                if (vibrationEnabled) {
+                    vibrate()
+                }
 
                 val releaseRunnable = Runnable {
                     releaseAlertAudioFocus(alertId)
@@ -807,10 +981,15 @@ class SoundMonitorService : Service() {
                 handler.postDelayed(releaseRunnable, 900)
             }
 
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Alert playback failed", e)
             releaseAlertAudioFocus()
             synchronized(lifecycleLock) {
-                if (!destroyed && isSessionActive(currentSession)) {
+                if (
+                    vibrationEnabled &&
+                    !destroyed &&
+                    isSessionActive(currentSession)
+                ) {
                     vibrate()
                 }
             }
@@ -894,7 +1073,8 @@ class SoundMonitorService : Service() {
                 vibrator.vibrate(350)
             }
 
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Vibration failed", e)
         }
     }
 
@@ -904,6 +1084,10 @@ class SoundMonitorService : Service() {
         level: Int? = null,
         db: Int? = null,
         alert: Boolean = false,
+        alertEventId: String? = null,
+        alertName: String? = null,
+        alertScore: Int? = null,
+        alertTime: Long? = null,
         error: String? = null,
         historyChanged: Boolean = false
     ) {
@@ -931,6 +1115,11 @@ class SoundMonitorService : Service() {
             putExtra("alert", alert)
             putExtra("history", historyChanged)
 
+            alertEventId?.let { putExtra("alert_event_id", it) }
+            alertName?.let { putExtra("alert_name", it) }
+            alertScore?.let { putExtra("alert_score", it) }
+            alertTime?.let { putExtra("alert_time", it) }
+
             error?.let {
                 putExtra("error", it)
             }
@@ -951,9 +1140,11 @@ class SoundMonitorService : Service() {
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_ACTIVE, false)
-                .remove("last_alert")
                 .apply()
         }
+
+
+        clearLastAlert()
 
         try {
             recorder?.stop()
@@ -1076,9 +1267,11 @@ class SoundMonitorService : Service() {
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_ACTIVE, false)
-                .remove("last_alert")
                 .apply()
         }
+
+
+        clearLastAlert()
 
         try {
             recorder?.stop()

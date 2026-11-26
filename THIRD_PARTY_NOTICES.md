@@ -18,6 +18,12 @@ https://github.com/tensorflow/models/tree/master/research/audioset/yamnet
 TensorFlow tutorial:
 https://www.tensorflow.org/hub/tutorials/yamnet
 
+TensorFlow Hub lists the published YAMNet model variation as Apache 2.0:
+https://tfhub.dev/google/yamnet/1
+
+The TensorFlow Models license text is available at:
+https://github.com/tensorflow/models/blob/master/LICENSE
+
 SHA-256 of the included file:
 10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de
 
@@ -48,6 +54,11 @@ cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2
 Note:
 The exact provenance and applicable license of the included copy
 have not yet been independently verified.
+The official Apache 2.0 listing supports the upstream YAMNet model,
+but does not by itself prove which upstream artifact produced this
+exact copied binary or class-map file. Verify and record that chain
+before public or commercial distribution, and ship the required
+license and notice text.
 
 ## 3. Project Notice
 
