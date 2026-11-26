@@ -78,6 +78,7 @@ class MainActivity : AppCompatActivity() {
     private var alertItem: HistoryItem? = null
 
     private data class HistoryItem(
+        val id: String,
         val name: String,
         val score: Int,
         val time: Long,
@@ -108,11 +109,24 @@ class MainActivity : AppCompatActivity() {
             }
             if (intent.getBooleanExtra("alert", false)) {
                 currentAlert = "تم اكتشاف صوت"
-                alertItem = latestHistoryItem()
+                val alertName = intent.getStringExtra("alert_name")
+                val alertEventId = intent.getStringExtra("alert_event_id")
+                val alertTime = intent.getLongExtra("alert_time", 0L)
+                if (!alertName.isNullOrBlank() && alertEventId != null && alertTime > 0L) {
+                    alertItem = HistoryItem(
+                        id = alertEventId,
+                        name = alertName,
+                        score = intent.getIntExtra("alert_score", 0),
+                        time = alertTime,
+                        alert = true
+                    )
+                } else {
+                    alertItem = latestHistoryItem()
+                }
                 currentTab = TAB_ALERT
             }
             if (intent.getBooleanExtra("history", false)) {
-                alertItem = latestHistoryItem() ?: alertItem
+                if (alertItem == null) alertItem = latestHistoryItem()
             }
             refreshRenderedState(
                 renderTab = intent.getBooleanExtra("alert", false) ||
@@ -461,7 +475,14 @@ class MainActivity : AppCompatActivity() {
             SoundMonitorService.KEY_CATEGORY_IMPACT to "ارتطام",
             SoundMonitorService.KEY_CATEGORY_ALARM to "إنذارات",
             SoundMonitorService.KEY_CATEGORY_DOORBELL to "جرس الباب",
-            SoundMonitorService.KEY_CATEGORY_DOOR to "أصوات الأبواب"
+            SoundMonitorService.KEY_CATEGORY_DOOR to "أصوات الأبواب",
+            SoundMonitorService.KEY_CATEGORY_CRYING to "البكاء وبكاء الأطفال",
+            SoundMonitorService.KEY_CATEGORY_PHONE to "رنين الهاتف",
+            SoundMonitorService.KEY_CATEGORY_SIREN to "صفارات الطوارئ",
+            SoundMonitorService.KEY_CATEGORY_HORN to "أبواق السيارات",
+            SoundMonitorService.KEY_CATEGORY_FOOTSTEPS to "خطوات المشي",
+            SoundMonitorService.KEY_CATEGORY_BELL to "الأجراس العامة",
+            SoundMonitorService.KEY_CATEGORY_SIGNAL to "البازر والصفير"
         ).forEach { (key, label) ->
             addCategorySwitch(categoriesCard, label, key)
         }
@@ -551,11 +572,13 @@ class MainActivity : AppCompatActivity() {
             .setMessage("سيتم حذف جميع الأحداث المحفوظة. لا يمكن التراجع عن هذا الإجراء.")
             .setNegativeButton("إلغاء", null)
             .setPositiveButton("مسح السجل") { _, _ ->
-                getSharedPreferences(prefsName, MODE_PRIVATE)
-                    .edit()
-                    .putString(SoundMonitorService.KEY_HISTORY, "[]")
-                    .remove("last_alert")
-                    .apply()
+                synchronized(SoundMonitorService.HISTORY_LOCK) {
+                    getSharedPreferences(prefsName, MODE_PRIVATE)
+                        .edit()
+                        .putString(SoundMonitorService.KEY_HISTORY, "[]")
+                        .remove("last_alert")
+                        .apply()
+                }
                 currentEvent = "لا يوجد اكتشاف بعد"
                 currentAlert = "لا توجد تنبيهات جديدة"
                 alertItem = null
@@ -766,12 +789,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun readHistory(): List<HistoryItem> {
-        val raw = getSharedPreferences(prefsName, MODE_PRIVATE).getString(SoundMonitorService.KEY_HISTORY, "[]") ?: "[]"
+        val raw = synchronized(SoundMonitorService.HISTORY_LOCK) {
+            getSharedPreferences(prefsName, MODE_PRIVATE)
+                .getString(SoundMonitorService.KEY_HISTORY, "[]") ?: "[]"
+        }
         return try {
             val array = JSONArray(raw)
             (0 until array.length()).map { index ->
                 val item = array.getJSONObject(index)
-                HistoryItem(item.optString("name", "صوت غير معروف"), item.optInt("score", 0), item.optLong("time", 0L), item.optBoolean("alert", false))
+                val time = item.optLong("time", 0L)
+                val name = item.optString("name", "صوت غير معروف")
+                HistoryItem(
+                    id = item.optString("id", "$time-$name"),
+                    name = name,
+                    score = item.optInt("score", 0),
+                    time = time,
+                    alert = item.optBoolean("alert", false)
+                )
             }
         } catch (_: Exception) {
             emptyList()
